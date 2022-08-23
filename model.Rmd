@@ -1,0 +1,381 @@
+---
+title: "Endometrio"
+---
+
+## Library
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library("survival")
+library("survminer")
+library('ggplot2')
+library('mctest')
+library(randomForestSRC)
+library(tibble)
+library(cvms)
+library(xgboost)
+library(shapper)
+library(corrplot)
+library(caret)
+
+```
+
+## Load Data
+
+For binary features:
+- 0 means no feature
+- 1 means yes feature 
+
+For figo stage:
+Increasing number for stage
+
+For treatment type:
+
+- 0 both
+- 1 neither
+- 2 pharma
+- 3 radiation
+
+```{r, fig.width=15,fig.height=15}
+
+data = read.csv('output/final_normalized.csv')
+
+data$Patient.ID <- NULL
+data$Age <- NULL
+data$age_at_index <- NULL
+data$year_of_diagnosis <- NULL
+data$TMB_high <- NULL
+data$prior_treatment <- NULL
+#data$treatment <- NULL
+data$X <- NULL
+data$L1CAM <- NULL
+data$IFNg_effTcell <- NULL
+data$IFNg6 <- NULL
+data$IFNgei18 <- NULL
+data$chemok <- NULL
+data$effTcell <- NULL
+
+#corrplot(cor(data))
+```
+
+
+## COX
+
+```{r echo=FALSE, fig.height=7, message=FALSE, warning=FALSE}
+
+# Multivariata
+res.cox <- coxph(Surv(DFS_months,DFS_binary) ~ ., data = data, singular.ok=T)
+# Proportional Risk Assumption 
+test.ph <- cox.zph(res.cox)
+
+# univariata
+cox_figo <- coxph(Surv(DFS_months,DFS_binary) ~ figo_stage, data = data, singular.ok=T)
+cox_bruno <- coxph(Surv(DFS_months,DFS_binary) ~ bruno_sig, data = data, singular.ok=T)
+cox_pole <- coxph(Surv(DFS_months,DFS_binary) ~ POLE, data = data, singular.ok=T)
+cox_eosinop <- coxph(Surv(DFS_months,DFS_binary) ~ Eosinophils, data = data, singular.ok=T)
+cox_mastR <- coxph(Surv(DFS_months,DFS_binary) ~ Mast.cells.resting, data = data, singular.ok=T)
+cox_MSI <- coxph(Surv(DFS_months,DFS_binary) ~ MSI, data = data, singular.ok=T)
+
+print('Eosinophils')
+cox_eosinop
+print('Figo Stage')
+cox_figo
+print('POLE')
+cox_pole
+print('Mast Resting')
+cox_mastR
+print('MSI')
+cox_MSI
+
+```
+
+
+
+## Feature selection based on RSF
+
+```{r echo=FALSE, fig.height=15, fig.width=20, message=FALSE, warning=FALSE}
+
+obj <- rfsrc(Surv(DFS_months,DFS_binary) ~ . , data,
+             ntree = 5000, # stability
+             nodesize = 10, 
+             nsplit = 10, # limit n split to nsplit -> computationally fav. and mitigates bias on cont variables. (too many splits)
+             importance = 'permute',
+             block.size = 50, # reduce overfitting
+             seed = 3)
+print(obj)
+
+```
+
+### Feature Importance
+
+```{r eval=T, fig.height=6, fig.width=7, message=FALSE, warning=FALSE, include=T}
+
+permute_class <- vimp(obj, importance = 'permute')
+anti_class <- vimp(obj, importance = 'anti')
+
+ac = anti_class$importance 
+ac = names(ac[ac>0])
+
+pc = permute_class$importance 
+pc = names(pc[pc>0])
+
+features = intersect(pc,ac)
+
+```
+
+features <- c("figo_stage","TP53","POLE","MSI","TMB","B.cells.memory","T.cells.CD4.memory.resting","T.cells.CD4.memory.activated","NK.cells.resting","NK.cells.activated","Macrophages.M1","Mast.cells.resting","Eosinophils","Neutrophils","MPS","bruno_sig","treatment")
+
+```{r eval=T, fig.height=6, fig.width=15, message=FALSE, warning=FALSE, echo = F, include=TRUE}
+
+#plot(permute_class,xlab = "Variable Importance (permute)")
+#plot(anti_class,xlab = "Variable Importance (anti)")
+#par(oma = c(0.5, 10, 0.5, 0.5))
+#plot(subsample(obj,B=100, block.size = 10))
+
+```
+
+#### Interpretability
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+
+#plot(get.tree(obj,tree.id = 200,target = 0,show.plots = T))
+
+```
+
+```{r eval=T, fig.height=5, fig.width=6, message=FALSE, warning=FALSE, include=T}
+#plot.variable(obj,xvar.names = features,time = 15, sorted=T, surv.type = "surv", partial = T, smooth.lines = F, OOB=T,plots.per.page = 5)
+
+```
+
+## Function
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+f <- function(data, features, plot, s){
+  
+  ## data
+  set.seed(s)
+  train.index <- createDataPartition(data$DFS_binary, p = .75, list = FALSE)
+  train <- data[ train.index,]
+  test  <- data[-train.index,]
+  train = train[,features]
+  test = test[,features]
+  
+  ######## random survival forest
+  rsf <- rfsrc(Surv(DFS_months,DFS_binary) ~ . , train,
+               ntree = 5000, # stability
+               nodesize = 10, 
+               nsplit = 10, # limit n split to nsplit -> computationally fav. and mitigates bias on cont variables. (too many splits)
+               importance = 'permute',
+               block.size = 50)
+  
+  FI_surv = rsf$importance
+  ER_surv = mean(rsf$err.rate, na.rm = T)
+
+  y.pred <- predict(rsf,newdata = test)
+  y.time = round(y.pred$time.interest,2)
+  y.prob = y.pred$survival
+  df_pred = t(data.frame(y.prob))
+  rownames(df_pred) = y.time
+  
+  recidiva <- df_pred[,which(test$DFS_binary == 1)]
+  recidiva$median <- apply(recidiva, 1, median, na.rm=T)
+  dfree <- df_pred[,which(test$DFS_binary == 0)]
+  dfree$median <- apply(dfree, 1, median, na.rm=T)
+  
+  ######## classification RF
+  train$DFS_binary <- as.factor(train$DFS_binary) 
+  train$DFS_months <- NULL
+  
+  classification <- imbalanced(as.formula(DFS_binary ~ .), data = train, 
+                   method = "rfq",
+                   ntree=10000, 
+                   block.size = 100, 
+                   nsplit = 10,
+                   nodesize = 10
+                   )
+  
+  FI_class = classification$importance # importance
+  ER_class = mean(classification$err.rate, na.rm = T)
+  
+  ## predictions 
+  y.pred.binary <- predict(classification,newdata = test)
+  t=get.imbalanced.performance(y.pred.binary)[4]
+  pout <- y.pred.binary$predicted>t
+  pred = as.integer(pout[,2])
+  true = test$DFS_binary
+  
+  ## performance evaluation
+  cfm = as_tibble(table(data.frame(pred = pred, true = true)))
+  
+  acc_balanced =(cfm$n[4]/(cfm$n[4]+cfm$n[3]) + cfm$n[1]/(cfm$n[1]+cfm$n[2]))/2
+  acc = (cfm$n[1] + cfm$n[4]) / (cfm$n[1] + cfm$n[4] + cfm$n[2] + cfm$n[3])
+  truepos = cfm$n[4]/(cfm$n[4]+cfm$n[3])
+  falsepos = cfm$n[2]/(cfm$n[1]+cfm$n[2])
+  
+  print(paste('balanced ACC',acc_balanced))
+  print(paste('ACC',acc))
+  print(paste('true POS',truepos))
+  print(paste('false POS',falsepos))
+  
+  if (plot == TRUE){
+    ## plot
+    plot_confusion_matrix(cfm, 
+                          target_col = "true", 
+                          prediction_col = "pred",
+                          counts_col = "n")
+    
+    par(oma = c(0.5, 10, 0.5, 0.5))
+    plot(subsample(ob,B=100, block.size = 100))
+    
+    par(cex.axis = 2.0, cex.lab = 2.0, cex.main = 3.0, mar = c(6.0,17,4,1), mgp = c(4, 1, 0))
+    plot(names(recidiva$median),recidiva$median, ylab = 'Desease-Free Survival Probability',xlab = "Months", type='s', col='red', lwd=4, main = 'Therapy')
+    lines(names(dfree$median),dfree$median, xlab = "Months", type='s',col='green', lwd=4)
+  
+  }
+
+  return(list(acc_balanced, acc, truepos, falsepos, ER_surv, ER_class, FI_surv, FI_class))
+}
+
+```
+
+
+```{r}
+
+features <- c("figo_stage","TP53","POLE","MSI","TMB","B.cells.memory","T.cells.CD4.memory.resting","T.cells.CD4.memory.activated","NK.cells.resting","NK.cells.activated","Macrophages.M1","Mast.cells.resting","Eosinophils","Neutrophils","MPS","bruno_sig","treatment")
+features = c(features,'DFS_binary','DFS_months')
+
+results <- list()
+for (s in seq(from=1, to=100, by=10)){
+  results <- append(results,list(f(data, features, F, s)))
+}
+
+acc_imb <- 0
+acc <- 0
+tp <- 0 
+
+for (result in results){
+  acc_imb <- acc_imb + result[[1]]
+  acc <- acc + result[[3]]
+  tp <- tp + result[[2]]
+}
+
+print(tp/10)
+print(acc/10)
+print(acc_imb/10)
+
+
+
+```
+
+
+
+#### Case Study
+
+```{r echo=FALSE, fig.height=5, fig.width=8, message=FALSE, warning=FALSE, include=FALSE, eval=FALSE}
+
+y.pred.cost <- predict(obj,newdata = test)
+y.time = round(y.pred.cost$time.interest,2)
+y.prob = y.pred.cost$survival
+df_pred = t(data.frame(y.prob))
+rownames(df_pred) = y.time
+par(oma = c(0.5, 10, 0.5, 0.5))
+par(cex.axis = 2.0, cex.lab = 2.0, cex.main = 2.0, mar = c(6.0,17,1,1), mgp = c(4, 1, 0))
+plot(names(recidiva$median),recidiva$median, ylab = 'Desease-Free Survival Probability',xlab = "Months", type='s', col='orange', lwd=4)
+
+```
+
+
+
+
+### Linee Guida
+
+```{r echo=FALSE}
+
+features <- c('DFS_binary','DFS_months','TP53','POLE','MSI','figo_stage')
+
+
+```
+
+
+## Treatment Specific
+
+```{r eval=T,  message=FALSE, warning=FALSE, include=T, fig.height=10}
+
+#check unbias
+table(train[train$treatment == 0,]$DFS_binary)
+table(train[train$treatment == 1,]$DFS_binary)
+table(train[train$treatment == 2,]$DFS_binary)
+table(train[train$treatment == 3,]$DFS_binary)
+
+train_small_1 <- train[train$treatment %in% c(0,2,3),]
+test_small_1 <- test[test$treatment %in% c(0,2,3),]
+
+obj1 <- rfsrc(Surv(DFS_months,DFS_binary) ~ . , train_small_1,
+             ntree = 5000, # stability
+             nodesize = 10, 
+             nsplit = 10, # limit n split to nsplit -> computationally fav. and mitigates bias on cont variables. (too many splits)
+             importance = 'permute',
+             block.size = 100,
+             seed = 12)
+print(obj1)
+
+y.pred <- predict(obj1,newdata = test_small_1)
+y.time = round(y.pred$time.interest,2)
+y.prob = y.pred$survival
+df_pred = t(data.frame(y.prob))
+rownames(df_pred) = y.time
+
+recidiva <- df_pred[,which(test_small_1$DFS_binary == 1)]
+recidiva$median <- apply(recidiva, 1, median, na.rm=T)
+dfree <- df_pred[,which(test_small_1$DFS_binary == 0)]
+dfree$median <- apply(dfree, 1, median, na.rm=T)
+
+par(cex.axis = 2.0, cex.lab = 2.0, cex.main = 3.0, mar = c(6.0,17,4,1), mgp = c(4, 1, 0))
+plot(names(recidiva$median),recidiva$median, ylab = 'Desease-Free Survival Probability',xlab = "Months", type='s', col='red', lwd=4, main = 'Therapy')
+lines(names(dfree$median),dfree$median, xlab = "Months", type='s',col='green', lwd=4)
+
+train_small_1$DFS_binary <- as.factor(train_small_1$DFS_binary)
+ob_1 <- imbalanced(as.formula(DFS_binary ~ . ), train_small_1,
+             ntree = 5000, # stability
+             nodesize = 10, 
+             nsplit = 10, # limit n split to nsplit -> computationally fav. and mitigates bias on cont variables. (too many splits)
+             block.size = 50,
+             method = "rfq",
+             seed = 12)
+y.pred.1 <- predict(ob_1,newdata = test_small_1)
+
+print(get.imbalanced.performance(y.pred.figo))
+t=0.18
+pout <- y.pred.binary$predicted>t
+pout <- round(y.pred.figo$predicted )
+pred = pout[,2] 
+true = test_small$DFS_binary 
+
+cfm = as_tibble(table(data.frame(pred = pred, true = true)))
+
+plot_confusion_matrix(cfm, 
+                      target_col = "true", 
+                      prediction_col = "pred",
+                      counts_col = "n")
+
+acc_balanced =(cfm$n[4]/(cfm$n[4]+cfm$n[3]) + cfm$n[1]/(cfm$n[1]+cfm$n[2]))/2
+acc = (cfm$n[1] + cfm$n[4]) / (cfm$n[1] + cfm$n[4] + cfm$n[2] + cfm$n[3])
+truepos = cfm$n[4]/(cfm$n[4]+cfm$n[3])
+falsepos = cfm$n[2]/(cfm$n[1]+cfm$n[2])
+
+print(paste('balanced ACC',acc_balanced))
+print(paste('ACC',acc))
+print(paste('true POS',truepos))
+print(paste('false POS',falsepos))
+
+```
+
+## Export
+
+```{r}
+
+data = read.csv('output/final_normalized.csv')
+export_data = data[,c(features,'DFS_months','DFS_binary')]
+write.csv2(export_data,'filtered_final.csv')
+
+```
